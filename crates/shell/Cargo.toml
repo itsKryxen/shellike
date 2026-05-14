@@ -1,0 +1,10 @@
+[package]
+name = "shell"
+version = "0.1.0"
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+parser = {path="../parser/"}
