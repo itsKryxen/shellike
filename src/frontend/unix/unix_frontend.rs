@@ -153,21 +153,40 @@ impl FrontendRunner for UnixFrontend {
 }
 
 fn read_key(stdin: &mut impl Read) -> io::Result<FrontendKey> {
-    let mut byte = [0u8; 1];
-    stdin.read_exact(&mut byte)?;
+    let mut first = [0u8; 1];
+    stdin.read_exact(&mut first)?;
 
-    match byte[0] {
-        b'\r' | b'\n' => Ok(FrontendKey::Enter),
-        0x7f | 0x08 => Ok(FrontendKey::Backspace),
-        b'\t' => Ok(FrontendKey::Tab),
-        0x03 => Ok(FrontendKey::CtrlC),
-        0x04 => Ok(FrontendKey::CtrlD),
-        0x1b => read_escape_sequence(stdin),
+    match first[0] {
+        b'\r' | b'\n' => return Ok(FrontendKey::Enter),
+        0x7f | 0x08 => return Ok(FrontendKey::Backspace),
+        b'\t' => return Ok(FrontendKey::Tab),
+        0x03 => return Ok(FrontendKey::CtrlC),
+        0x04 => return Ok(FrontendKey::CtrlD),
+        0x1b => return read_escape_sequence(stdin),
+        byte if byte.is_ascii_control() => {
+            return Ok(FrontendKey::Escape);
+        }
 
-        byte if byte.is_ascii() && !byte.is_ascii_control() => Ok(FrontendKey::Char(byte as char)),
-
-        _ => Ok(FrontendKey::Escape),
+        _ => {}
     }
+    let width = match utf8_char_width(first[0]) {
+        Some(w) => w,
+        None => return Ok(FrontendKey::Escape),
+    };
+    let mut buf = [0u8; 4];
+    buf[0] = first[0];
+    if width > 1 {
+        stdin.read_exact(&mut buf[1..width])?;
+    }
+    let s = match std::str::from_utf8(&buf[..width]) {
+        Ok(w) => w,
+        Err(_) => return Ok(FrontendKey::Escape),
+    };
+    let ch = match s.chars().next() {
+        Some(ch) => ch,
+        None => return Ok(FrontendKey::Escape),
+    };
+    Ok(FrontendKey::Char(ch))
 }
 fn read_escape_sequence(stdin: &mut impl Read) -> io::Result<FrontendKey> {
     let mut seq = [0u8; 1];
@@ -220,4 +239,14 @@ fn next_char_boundary(s: &str, cursor: usize) -> usize {
         .nth(1)
         .map(|(idx, _)| cursor + idx)
         .unwrap_or(s.len())
+}
+
+fn utf8_char_width(first: u8) -> Option<usize> {
+    match first {
+        0x00..=0x7F => Some(1), //0xxxxxxx
+        0xC0..=0xDF => Some(2), //110xxxxx
+        0xE0..=0xEF => Some(3), //1110xxxx
+        0xF0..=0xF7 => Some(4), //11110xxx
+        _ => None,
+    }
 }
