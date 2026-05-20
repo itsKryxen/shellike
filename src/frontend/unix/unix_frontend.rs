@@ -1,73 +1,20 @@
-use crate::frontend::{
-    common::{
-        frame::{FrontendEffect, FrontendFrame},
-        frontend::FrontendRunner,
-        key::FrontendKey,
-    },
-    unix::termios::RawMode,
-};
+use crate::frontend::common::key::FrontendKey;
+use crate::frontend::unix::termios::RawMode;
+use crate::shell::result::ShellResult;
+use crate::shell::shell::Shell;
+use crate::{frontend::common::frontend::FrontendRunner, shell::result::ShellEffects};
 use std::io::{self, Read, Write};
+
 pub struct UnixFrontend {
     input: String,
     cursor: usize,
 }
-impl FrontendRunner for UnixFrontend {
-    fn new() -> Self {
-        Self {
-            input: String::new(),
-            cursor: 0,
-        }
-    }
-
-    fn run(&mut self) -> std::io::Result<()> {
-        let _raw = RawMode::enable()?;
-        let mut stdin = io::stdin().lock();
-
-        self.draw_input()?;
-
-        loop {
-            let key = read_key(&mut stdin)?;
-            let frame = self.handle_key(key);
-
-            match frame.effect {
-                FrontendEffect::None => {
-                    for line in frame.output {
-                        println!("\r{line}");
-                    }
-                    self.draw_input()?;
-                }
-
-                FrontendEffect::ClearScreen => {
-                    print!("\x1B[2J\x1B[H");
-                    self.draw_input()?;
-                    io::stdout().flush()?;
-                }
-
-                FrontendEffect::Exit => {
-                    println!();
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn submit_data(&mut self, input: &str) -> FrontendFrame {
-        match input {
-            "" => FrontendFrame::input("shellike> ", ""),
-            "exit" => FrontendFrame::exit(),
-            "clear" => FrontendFrame::clear(),
-            other => FrontendFrame::output(vec![format!("input: {other}")]),
-        }
-    }
-
-    fn handle_key(&mut self, key: FrontendKey) -> FrontendFrame {
+impl UnixFrontend {
+    fn handle_edit_key(&mut self, key: FrontendKey) {
         match key {
             FrontendKey::Char(ch) => {
                 self.input.insert(self.cursor, ch);
                 self.cursor += ch.len_utf8();
-                FrontendFrame::input("shellike> ", &self.input)
             }
 
             FrontendKey::Backspace => {
@@ -76,8 +23,6 @@ impl FrontendRunner for UnixFrontend {
                     self.input.replace_range(prev..self.cursor, "");
                     self.cursor = prev;
                 }
-
-                FrontendFrame::input("shellike> ", &self.input)
             }
 
             FrontendKey::Delete => {
@@ -85,65 +30,60 @@ impl FrontendRunner for UnixFrontend {
                     let next = next_char_boundary(&self.input, self.cursor);
                     self.input.replace_range(self.cursor..next, "");
                 }
-
-                FrontendFrame::input("shellike> ", &self.input)
             }
 
             FrontendKey::Left => {
                 if self.cursor > 0 {
                     self.cursor = previous_char_boundary(&self.input, self.cursor);
                 }
-
-                FrontendFrame::input("shellike> ", &self.input)
             }
 
             FrontendKey::Right => {
                 if self.cursor < self.input.len() {
                     self.cursor = next_char_boundary(&self.input, self.cursor);
                 }
-
-                FrontendFrame::input("shellike> ", &self.input)
             }
 
             FrontendKey::Home => {
                 self.cursor = 0;
-                FrontendFrame::input("shellike> ", &self.input)
             }
 
             FrontendKey::End => {
                 self.cursor = self.input.len();
-                FrontendFrame::input("shellike> ", &self.input)
-            }
-
-            FrontendKey::Enter => {
-                println!();
-
-                let line = std::mem::take(&mut self.input);
-                self.cursor = 0;
-
-                self.submit_data(line.trim())
             }
 
             FrontendKey::CtrlC => {
-                println!("^C");
                 self.input.clear();
                 self.cursor = 0;
-                FrontendFrame::input("shellike> ", "")
             }
 
-            FrontendKey::CtrlD => {
-                if self.input.is_empty() {
-                    FrontendFrame::exit()
-                } else {
-                    FrontendFrame::input("shellike> ", &self.input)
-                }
-            }
-
-            _ => FrontendFrame::input("shellike> ", &self.input),
+            _ => {}
         }
     }
-}
-impl UnixFrontend {
+    fn render_shell_result(&mut self, result: ShellResult) -> io::Result<bool> {
+        for line in result.stdout {
+            println!("\r{line}");
+        }
+
+        for line in result.stderr {
+            eprintln!("\r{line}");
+        }
+
+        match result.effect {
+            ShellEffects::None => Ok(false),
+
+            ShellEffects::ClearScreen => {
+                print!("\x1B[2J\x1B[H");
+                io::stdout().flush()?;
+                Ok(false)
+            }
+
+            ShellEffects::Exit => {
+                println!();
+                Ok(true)
+            }
+        }
+    }
     fn draw_input(&self) -> io::Result<()> {
         let prompt = "shellike> ";
 
@@ -159,6 +99,56 @@ impl UnixFrontend {
         }
 
         io::stdout().flush()
+    }
+}
+impl FrontendRunner for UnixFrontend {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn run(&mut self, shell: &mut Shell) -> io::Result<()> {
+        let _raw = RawMode::enable()?;
+        let mut stdin = io::stdin().lock();
+
+        self.draw_input()?;
+
+        loop {
+            let key = read_key(&mut stdin)?;
+
+            match key {
+                FrontendKey::Enter => {
+                    println!();
+
+                    let line = std::mem::take(&mut self.input);
+                    self.cursor = 0;
+
+                    let result = shell.submit_line(line.trim());
+
+                    let should_exit = self.render_shell_result(result)?;
+
+                    if should_exit {
+                        break;
+                    }
+
+                    self.draw_input()?;
+                }
+
+                FrontendKey::CtrlD if self.input.is_empty() => {
+                    println!();
+                    break;
+                }
+
+                key => {
+                    self.handle_edit_key(key);
+                    self.draw_input()?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -179,7 +169,6 @@ fn read_key(stdin: &mut impl Read) -> io::Result<FrontendKey> {
         _ => Ok(FrontendKey::Escape),
     }
 }
-
 fn read_escape_sequence(stdin: &mut impl Read) -> io::Result<FrontendKey> {
     let mut seq = [0u8; 1];
 
